@@ -1,3 +1,13 @@
+ttypxy
+
+# Ctags cache
+cscope.*
+tags
+
+# Vim cache
+*.swp
+*.swo
+
 # Prerequisites
 *.d
 
