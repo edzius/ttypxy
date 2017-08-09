@@ -451,6 +451,16 @@ static void ttypxy_run(struct ttypxy *ctx)
 			if (n <= 0)
 				break;
 
+			for (i = 0; i < ctx->frontdev_cnt; i++) {
+				if (!ctx->frontdevs[i].td_active)
+					continue;
+
+				if (xwrite(ctx->frontdevs[i].td_fd, buffer, n) != n)
+					warn("write(%s) front TTY failed: %s\n",
+					     ctx->frontdevs[i].td_pts_link,
+					     strerror(errno));
+			}
+
 			if (verbose)
 				hexdump(ctx->backdev.td_path, buffer, n);
 		}
@@ -458,12 +468,6 @@ static void ttypxy_run(struct ttypxy *ctx)
 		for (i = 0; i < ctx->frontdev_cnt; i++) {
 			if (!ctx->frontdevs[i].td_active)
 				continue;
-
-			if (n > 0)
-				if (xwrite(ctx->frontdevs[i].td_fd, buffer, n) != n)
-					warn("write(%s) front TTY failed: %s\n",
-					     ctx->frontdevs[i].td_pts_link,
-					     strerror(errno));
 
 			if (FD_ISSET(ctx->frontdevs[i].td_fd, &rfds)) {
 				n = xread(ctx->frontdevs[i].td_fd, buffer, sizeof(buffer));
