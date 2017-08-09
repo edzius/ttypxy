@@ -43,6 +43,7 @@ struct ttydevice {
 	struct termios td_origattr;
 	int td_pts_fd;
 	char td_pts_link[TTYNAMSZ];
+	int td_active;
 };
 
 #if 0
@@ -263,6 +264,8 @@ static void hexdump(char *ttyname, void *addr, int len) {
 
 static void setup_back_tty(struct ttydevice *td, const char *ttyfile)
 {
+	/* Just for consistency, back device MUST be active */
+	td->td_active = 1;
 	/* Open the serial port */
 	td->td_fd = open(ttyfile, O_RDWR | O_NOCTTY | O_SYNC);
 	if (td->td_fd < 0)
@@ -280,6 +283,11 @@ static void setup_back_tty(struct ttydevice *td, const char *ttyfile)
 
 	/* Extra copy tty device file name, for debugging */
 	strncpy(td->td_path, ttyfile, TTYNAMSZ);
+}
+
+static void teardown_back_tty(struct ttydevice *td)
+{
+	tcsetattr(td->td_fd, TCSAFLUSH, &td->td_origattr);
 }
 
 static void setup_front_tty(struct ttydevice *td, const char *ttyfile, const struct stat *ttyst)
@@ -318,6 +326,16 @@ static void setup_front_tty(struct ttydevice *td, const char *ttyfile, const str
 	} else {
 		warn("symlink() '%s' -> '%s' failed: %s\n", td->td_pts_link, ttyfile, strerror(errno));
 	}
+	/* Initial mark as active, front device may become inactive on error */
+	td->td_active = 1;
+}
+
+static void teardown_front_tty(struct ttydevice *td)
+{
+	if (!td->td_active)
+		return;
+	unlink(td->td_pts_link);
+	td->td_active = 0;
 }
 
 static void usage(char *name)
@@ -390,9 +408,9 @@ static void ttypxy_shutdown(struct ttypxy *ctx)
 	int i;
 
 	for (i = 0; i < ctx->frontdev_cnt; i++)
-		unlink(ctx->frontdevs[i].td_pts_link);
+		teardown_front_tty(&ctx->frontdevs[i]);
 	free(ctx->frontdevs);
-	tcsetattr(ctx->backdev.td_fd, TCSAFLUSH, &ctx->backdev.td_origattr);
+	teardown_back_tty(&ctx->backdev);
 }
 
 static void ttypxy_run(struct ttypxy *ctx)
@@ -411,6 +429,8 @@ static void ttypxy_run(struct ttypxy *ctx)
 		maxfd = max(maxfd, ctx->backdev.td_fd);
 
 		for (i = 0; i < ctx->frontdev_cnt; i++) {
+			if (!ctx->frontdevs[i].td_active)
+				continue;
 			FD_SET(ctx->frontdevs[i].td_fd, &rfds);
 			maxfd = max(maxfd, ctx->frontdevs[i].td_fd);
 		}
@@ -436,6 +456,9 @@ static void ttypxy_run(struct ttypxy *ctx)
 		}
 
 		for (i = 0; i < ctx->frontdev_cnt; i++) {
+			if (!ctx->frontdevs[i].td_active)
+				continue;
+
 			if (n > 0)
 				if (xwrite(ctx->frontdevs[i].td_fd, buffer, n) != n)
 					warn("write(%s) front TTY failed: %s\n",
@@ -444,8 +467,12 @@ static void ttypxy_run(struct ttypxy *ctx)
 
 			if (FD_ISSET(ctx->frontdevs[i].td_fd, &rfds)) {
 				n = xread(ctx->frontdevs[i].td_fd, buffer, sizeof(buffer));
-				if (n <= 0)
+				if (n <= 0) {
+					warn("Disabled front TTY '%s' due to read error\n",
+					     ctx->frontdevs[i].td_pts_link);
+					teardown_front_tty(&ctx->frontdevs[i]);
 					continue;
+				}
 
 				if (xwrite(ctx->backdev.td_fd, buffer, n) != n)
 					warn("write(%s) back TTY failed: %s\n",
