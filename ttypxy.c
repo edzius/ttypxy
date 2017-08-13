@@ -22,12 +22,14 @@
 #include <pty.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
+
+#include "list.h"
 
 #define TTYNAMSZ	16
 #define TTY_BUFF_SIZE	4096
-#define TTY_DEVS_MAX	8
 
-#define max(x,y)       ((x) > (y) ? (x) : (y))
+#define MAX(x,y)       ((x) > (y) ? (x) : (y))
 
 enum {
 	FAIL_NONE,
@@ -37,13 +39,33 @@ enum {
 	FAIL_OTHER
 };
 
+enum {
+	TTY_FILE,
+	TTY_SOCKET
+};
+
+struct ttyhead {
+	int th_fd;
+	union {
+		char th_filelink[TTYNAMSZ];
+		struct sockaddr_in th_sockaddr;
+	};
+	struct list_head list;
+};
+
 struct ttydevice {
+	char td_type;
+	int td_active;
+	struct termios td_origattr;
 	char td_path[TTYNAMSZ];
 	int td_fd;
-	struct termios td_origattr;
 	int td_pts_fd;
 	char td_pts_link[TTYNAMSZ];
-	int td_active;
+	/* TODO(edzius): td_clients is multi entry form
+	 * or td_pts_fd, refactor and merge into single
+	 * property. */
+	unsigned char td_heads_cnt;
+	struct list_head td_heads;
 };
 
 #if 0
@@ -214,7 +236,18 @@ static int tty_set_speed(int fd)
 	return 0;
 }
 
-static void hexdump(char *ttyname, void *addr, int len) {
+static void fd_set_nio(int fd)
+{
+	int  result;
+	long oflags;
+
+	oflags = fcntl(fd, F_GETFL);
+	result = fcntl(fd, F_SETFL, oflags | O_NONBLOCK);
+	if (result < 0)
+		die(FAIL_OTHER, "fcntl(O_NONBLOCK) failed: %s.\n", strerror(errno));
+}
+
+static void hexdump(const char *ttyname, void *addr, int len) {
     int i;
     unsigned char buff[17];
     unsigned char *pc = (unsigned char*)addr;
@@ -334,20 +367,255 @@ static void teardown_front_tty(struct ttydevice *td)
 {
 	if (!td->td_active)
 		return;
-	unlink(td->td_pts_link);
+
 	td->td_active = 0;
+	unlink(td->td_pts_link);
+}
+
+static int parse_sock_addr(const char *straddr, struct sockaddr_in *binaddr)
+{
+	char *addrp;
+	char *portp;
+	char *tmpaddr = strdup(straddr);
+	if (!tmpaddr)
+		return -1;
+
+	memset(binaddr, 0, sizeof(*binaddr));
+
+	addrp = tmpaddr;
+	portp = strchr(tmpaddr, ':');
+	if (!portp) {
+		free(tmpaddr);
+		return -1;
+	}
+	*portp = 0;
+
+	binaddr->sin_family = AF_INET;
+	binaddr->sin_port = htons(atoi(++portp));
+
+	/* Check whether IP is set */
+	if (*addrp != 0) {
+		if (inet_pton(binaddr->sin_family, addrp, &binaddr->sin_addr) <= 0) {
+			free(tmpaddr);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static void setup_front_sock(struct ttydevice *td, const char *straddr)
+{
+	/* XXX(edzius): socket address should be passed as sockaddr_in
+	 * structure, address parsing and validation should be done in
+	 * arguments parsing routines. */
+	struct sockaddr_in addr;
+	int on = 1;
+
+	if (parse_sock_addr(straddr, &addr))
+		die(FAIL_FRONTEND, "Invalid socket address '%s'.\n", straddr);
+
+	td->td_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (td->td_fd < 0)
+		die(FAIL_FRONTEND, "socket() failed: %s\n", strerror(errno));
+
+	if (setsockopt(td->td_fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0)
+		die(FAIL_FRONTEND, "setsockopt(SO_REUSEADDR) failed: %s\n", strerror(errno));
+
+	if (bind(td->td_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+		die(FAIL_FRONTEND, "bind() failed: %s\n", strerror(errno));
+
+	if (listen(td->td_fd, 1) < 0)
+		die(FAIL_FRONTEND, "listen() failed: %s\n", strerror(errno));
+
+	/* Initialize clients heads */
+	INIT_LIST_HEAD(&td->td_heads);
+
+	/* Initial mark as active, front device may become inactive on error */
+	td->td_active = 1;
+	td->td_type = TTY_SOCKET;
+}
+
+static void teardown_front_sock(struct ttydevice *td)
+{
+	struct ttyhead *th, *n;
+
+	if (!td->td_active)
+		return;
+
+	td->td_active = 0;
+	close(td->td_fd);
+	list_for_each_entry_safe(th, n, &td->td_heads, list) {
+		close(th->th_fd);
+		list_del(&th->list);
+		free(th);
+	}
+	td->td_heads_cnt = 0;
+}
+
+static void create_front_sock_head(struct ttydevice *td, int fd, struct sockaddr_in *addr)
+{
+	struct ttyhead *th;
+
+	th = (struct ttyhead *)malloc(sizeof(*th));
+	if (!th)
+		die(FAIL_OTHER, "malloc() failed: %s\n", strerror(errno));
+
+	memset(th, 0, sizeof(*th));
+	memcpy(&th->th_sockaddr, addr, sizeof(*addr));
+	th->th_fd = fd;
+	list_add(&th->list, &td->td_heads);
+	td->td_heads_cnt++;
+}
+
+static void remove_front_sock_head(struct ttydevice *td, struct ttyhead *th)
+{
+	list_del(&th->list);
+	free(th);
+	td->td_heads_cnt--;
+}
+
+static const char* addr2text(struct sockaddr_in *addr)
+{
+	static char buffer[32];
+
+	if (!inet_ntop(addr->sin_family, &addr->sin_addr,
+		       buffer, sizeof(buffer)))
+		strcpy(buffer, "NoN");
+
+	return buffer;
+}
+
+static int ttypxy_handle_backdev(struct ttydevice *backdev,
+				 struct ttydevice *frontdevs,
+				 int frontdevs_cnt)
+{
+	int i;
+	int nread;
+	char buffer[TTY_BUFF_SIZE];
+	struct ttydevice *frontdev;
+	struct ttyhead *th;
+
+	nread = xread(backdev->td_fd, buffer, sizeof(buffer));
+	if (nread <= 0)
+		return -1;
+
+	for (i = 0; i < frontdevs_cnt; i++) {
+		frontdev = &frontdevs[i];
+
+		if (!frontdev->td_active)
+			continue;
+
+		if (frontdev->td_type == TTY_FILE) {
+			if (xwrite(frontdev->td_fd, buffer, nread) != nread)
+				warn("write(%s) front TTY failed: %s\n",
+				     frontdev->td_pts_link, strerror(errno));
+		} else if (frontdev->td_type == TTY_SOCKET) {
+			list_for_each_entry(th, &frontdev->td_heads, list) {
+				if (xwrite(th->th_fd, buffer, nread) != nread)
+					warn("write(%s) front socket failed: %s\n",
+					     th->th_fd, strerror(errno));
+			}
+		} else {
+			warn("Unknown frontdev type %i\n", frontdev->td_type);
+		}
+	}
+
+	if (verbose)
+		hexdump(backdev->td_path, buffer, nread);
+
+	return nread;
+}
+
+static int ttypxy_handle_frontdev(struct ttydevice *frontdev,
+				  struct ttydevice *backdev)
+{
+	if (frontdev->td_type == TTY_FILE) {
+		int nread;
+		char buffer[TTY_BUFF_SIZE];
+
+		nread = xread(frontdev->td_fd, buffer, sizeof(buffer));
+		if (nread <= 0) {
+			warn("Disabled front TTY '%s' due to read error\n",
+			     frontdev->td_pts_link);
+			teardown_front_tty(frontdev);
+			return -1;
+		}
+
+		if (xwrite(backdev->td_fd, buffer, nread) != nread)
+			warn("write(%s) back TTY failed: %s\n",
+			     backdev->td_path, strerror(errno));
+
+		if (verbose)
+			hexdump(frontdev->td_pts_link, buffer, nread);
+
+		return nread;
+	} else if (frontdev->td_type == TTY_SOCKET) {
+		int cfd;
+		struct sockaddr_in caddr;
+		socklen_t caddr_len = sizeof(caddr);
+
+		cfd = accept(frontdev->td_fd, (struct sockaddr *)&caddr, &caddr_len);
+		if (cfd < 0) {
+			warn("accept() failed: %s\n", strerror(errno));
+			return -1;
+		}
+
+		fd_set_nio(cfd);
+
+		create_front_sock_head(frontdev, cfd, &caddr);
+
+		if (verbose)
+			printf("Connected: %s\n", addr2text(&caddr));
+
+		return 0;
+	} else {
+		warn("Unknown frontdev type %i\n", frontdev->td_type);
+		return 0;
+	}
+}
+
+static int ttypxy_handle_frontdev_head(struct ttyhead *head, struct ttydevice *frontdev, struct ttydevice *backdev)
+{
+	int nread;
+	char buffer[TTY_BUFF_SIZE];
+
+	nread = xread(head->th_fd, buffer, sizeof(buffer));
+	if (nread <= 0) {
+		warn("Disconnected: %s\n", addr2text(&head->th_sockaddr));
+		close(head->th_fd);
+		remove_front_sock_head(frontdev, head);
+		return 0;
+	}
+
+	if (xwrite(backdev->td_fd, buffer, nread) != nread)
+		warn("write(%s) back TTY failed: %s\n",
+		     backdev->td_path, strerror(errno));
+
+	if (verbose)
+		hexdump(addr2text(&head->th_sockaddr), buffer, nread);
+
+	return nread;
 }
 
 static void usage(char *name)
 {
-	fprintf(stderr, "Usage: %s back-device front-device [front-device2 ...]\n", name);
+	fprintf(stderr, "Usage: %s back-device front-device [front-device ...]\n", name);
+	fprintf(stderr, "\tback-device\tInput TTY device file path (e.g. /dev/ttyS0)\n");
+	fprintf(stderr, "\tfront-device\tOutput device definition:\n");
+	fprintf(stderr, "\t  - /path/file -- TTY device file path. Can be absolute\n"
+		"\t    or relative path.\n"
+		"\t    (e.g. /dev/ttyV0 or ./../myTTY or somefile)\n");
+	fprintf(stderr, "\t  - @[IP]:PORT -- Broker socket bind address. IP address\n"
+	        "\t    is optional, if omited ANY (0.0.0.0) is used.\n"
+		"\t    (e.g. @192.168.1.1:9999 or @0.0.0.0:8888 or @:53214)\n");
 	exit(FAIL_USAGE);
 }
 
 struct ttypxy {
 	struct ttydevice backdev;
 	struct ttydevice *frontdevs;
-	int frontdev_cnt;
+	int frontdevs_cnt;
 };
 
 static void ttypxy_init(struct ttypxy *ctx, int argc, char *argv[])
@@ -370,8 +638,8 @@ static void ttypxy_init(struct ttypxy *ctx, int argc, char *argv[])
 			break;
 		}
 
-	ctx->frontdev_cnt = argc - optind - 1;
-	if (showhelp || (ctx->frontdev_cnt < 2))
+	ctx->frontdevs_cnt = argc - optind - 1;
+	if (showhelp || (ctx->frontdevs_cnt < 2))
 		usage(argv[0]);
 
 	/* Prepare back TTY */
@@ -381,12 +649,17 @@ static void ttypxy_init(struct ttypxy *ctx, int argc, char *argv[])
 		die(FAIL_OTHER, "stat(%s) failed (wuh!?): %s\n", ctx->backdev.td_path, strerror(errno));
 
 	/* Prepare front TTYs */
-	ctx->frontdevs = calloc(ctx->frontdev_cnt, sizeof(*ctx->frontdevs));
+	ctx->frontdevs = calloc(ctx->frontdevs_cnt, sizeof(*ctx->frontdevs));
 	if (!ctx->frontdevs)
 		die(FAIL_OTHER, "calloc() failed: %s\n", strerror(errno));
 
-	for (i = 0; i < ctx->frontdev_cnt; i++)
-		setup_front_tty(&ctx->frontdevs[i], argv[optind+i], &backdev_st);
+	for (i = 0; i < ctx->frontdevs_cnt; i++) {
+		char *frontdev = argv[optind+i];
+		if (frontdev[0] == '@')
+			setup_front_sock(&ctx->frontdevs[i], frontdev+1);
+		else
+			setup_front_tty(&ctx->frontdevs[i], frontdev, &backdev_st);
+	}
 
 	if (chroot("/"))
 		warn("chroot() failed: %s\n", strerror(errno));
@@ -407,8 +680,11 @@ static void ttypxy_shutdown(struct ttypxy *ctx)
 {
 	int i;
 
-	for (i = 0; i < ctx->frontdev_cnt; i++)
-		teardown_front_tty(&ctx->frontdevs[i]);
+	for (i = 0; i < ctx->frontdevs_cnt; i++)
+		if (ctx->frontdevs[i].td_type == TTY_SOCKET)
+			teardown_front_sock(&ctx->frontdevs[i]);
+		else
+			teardown_front_tty(&ctx->frontdevs[i]);
 	free(ctx->frontdevs);
 	teardown_back_tty(&ctx->backdev);
 }
@@ -416,23 +692,32 @@ static void ttypxy_shutdown(struct ttypxy *ctx)
 static void ttypxy_run(struct ttypxy *ctx)
 {
 	int i;
-	char buffer[TTY_BUFF_SIZE];
+	struct ttyhead *th, *n;
 
 	while (!quit) {
-		int rv, n = 0;
+		int rv;
 		int maxfd = 0;
 		fd_set rfds;
 
 		FD_ZERO (&rfds);
 
 		FD_SET (ctx->backdev.td_fd, &rfds);
-		maxfd = max(maxfd, ctx->backdev.td_fd);
+		maxfd = MAX(maxfd, ctx->backdev.td_fd);
 
-		for (i = 0; i < ctx->frontdev_cnt; i++) {
+		for (i = 0; i < ctx->frontdevs_cnt; i++) {
 			if (!ctx->frontdevs[i].td_active)
 				continue;
+
 			FD_SET(ctx->frontdevs[i].td_fd, &rfds);
-			maxfd = max(maxfd, ctx->frontdevs[i].td_fd);
+			maxfd = MAX(maxfd, ctx->frontdevs[i].td_fd);
+
+			if (ctx->frontdevs[i].td_heads_cnt == 0)
+				continue;
+
+			list_for_each_entry(th, &ctx->frontdevs[i].td_heads, list) {
+				FD_SET(th->th_fd, &rfds);
+				maxfd = MAX(maxfd, th->th_fd);
+			}
 		}
 
 		rv = select(maxfd + 1, &rfds, NULL, NULL, NULL);
@@ -447,45 +732,25 @@ static void ttypxy_run(struct ttypxy *ctx)
 			continue;
 
 		if (FD_ISSET(ctx->backdev.td_fd, &rfds)) {
-			n = xread(ctx->backdev.td_fd, buffer, sizeof(buffer));
-			if (n <= 0)
+			if (ttypxy_handle_backdev(&ctx->backdev, ctx->frontdevs, ctx->frontdevs_cnt) <= 0)
 				break;
-
-			for (i = 0; i < ctx->frontdev_cnt; i++) {
-				if (!ctx->frontdevs[i].td_active)
-					continue;
-
-				if (xwrite(ctx->frontdevs[i].td_fd, buffer, n) != n)
-					warn("write(%s) front TTY failed: %s\n",
-					     ctx->frontdevs[i].td_pts_link,
-					     strerror(errno));
-			}
-
-			if (verbose)
-				hexdump(ctx->backdev.td_path, buffer, n);
 		}
 
-		for (i = 0; i < ctx->frontdev_cnt; i++) {
+		for (i = 0; i < ctx->frontdevs_cnt; i++) {
 			if (!ctx->frontdevs[i].td_active)
 				continue;
 
-			if (FD_ISSET(ctx->frontdevs[i].td_fd, &rfds)) {
-				n = xread(ctx->frontdevs[i].td_fd, buffer, sizeof(buffer));
-				if (n <= 0) {
-					warn("Disabled front TTY '%s' due to read error\n",
-					     ctx->frontdevs[i].td_pts_link);
-					teardown_front_tty(&ctx->frontdevs[i]);
-					continue;
-				}
+			if (FD_ISSET(ctx->frontdevs[i].td_fd, &rfds))
+				ttypxy_handle_frontdev(&ctx->frontdevs[i], &ctx->backdev);
 
-				if (xwrite(ctx->backdev.td_fd, buffer, n) != n)
-					warn("write(%s) back TTY failed: %s\n",
-					     ctx->backdev.td_path,
-					     strerror(errno));
+			if (ctx->frontdevs[i].td_heads_cnt == 0)
+				continue;
 
-				if (verbose)
-					hexdump(ctx->frontdevs[i].td_pts_link, buffer, n);
+			list_for_each_entry_safe(th, n, &ctx->frontdevs[i].td_heads, list) {
+				if (FD_ISSET(th->th_fd, &rfds))
+					ttypxy_handle_frontdev_head(th, &ctx->frontdevs[i], &ctx->backdev);
 			}
+
 		}
 	}
 }
